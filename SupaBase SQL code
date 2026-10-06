@@ -1,0 +1,218 @@
+
+
+drop trigger if exists on_auth_user_created on auth.users;
+drop function if exists public.handle_new_user() cascade;
+drop function if exists public.start_trip(text, text, int) cascade;
+drop function if exists public.end_trip(boolean) cascade;
+drop function if exists public.send_update(text) cascade;
+drop function if exists public.update_route(text, text) cascade;
+drop function if exists public.now_ms() cascade;
+drop table if exists public.alerts cascade;
+drop table if exists public.trips cascade;
+drop table if exists public.profiles cascade;
+
+-- Server clock in epoch milliseconds, so every phone uses the same start time
+create function public.now_ms() returns bigint
+language sql stable as $$
+  select (extract(epoch from clock_timestamp()) * 1000)::bigint
+$$;
+
+-- ---------------------------------------------------------------- tables
+
+create table public.profiles (
+  id          uuid primary key references auth.users(id) on delete cascade,
+  role        text not null check (role in ('STUDENT', 'DRIVER')),
+  first_name  text not null,
+  surname     text not null,
+  email       text not null,
+  residence   text,
+  direction   text check (direction in ('RESIDENCE_TO_CAMPUS', 'CAMPUS_TO_RESIDENCE')),
+  bus_number  text,
+  phone       text,
+  created_at  timestamptz not null default now()
+);
+
+create table public.trips (
+  id               bigint generated always as identity primary key,
+  driver_id        uuid not null references public.profiles(id) on delete cascade,
+  driver_name      text not null,
+  driver_phone     text,
+  bus_number       text not null,
+  residence        text not null,
+  direction        text not null check (direction in ('RESIDENCE_TO_CAMPUS', 'CAMPUS_TO_RESIDENCE')),
+  duration_minutes int  not null check (duration_minutes between 1 and 180),
+  started_at       bigint not null default public.now_ms(),
+  active           boolean not null default true
+);
+
+-- One active trip per driver and per bus
+create unique index one_active_trip_per_driver on public.trips (driver_id) where active;
+create unique index one_active_trip_per_bus    on public.trips (bus_number) where active;
+
+create table public.alerts (
+  id          bigint generated always as identity primary key,
+  title       text not null,
+  message     text not null check (char_length(message) <= 300),
+  bus_number  text not null,
+  residence   text,
+  direction   text,
+  created_at  bigint not null default public.now_ms()
+);
+
+-- ------------------------------------------------------ row level security
+-- Apps can only READ directly. All writes go through the functions below,
+-- which check who is calling (auth.uid()).
+
+alter table public.profiles enable row level security;
+alter table public.trips    enable row level security;
+alter table public.alerts   enable row level security;
+
+create policy "Users read their own profile" on public.profiles
+  for select to authenticated using (id = auth.uid());
+
+create policy "Signed-in users read trips" on public.trips
+  for select to authenticated using (true);
+
+create policy "Signed-in users read alerts" on public.alerts
+  for select to authenticated using (true);
+
+-- --------------------------------------------- create profile on sign-up
+
+create function public.handle_new_user() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare
+  m jsonb := coalesce(new.raw_user_meta_data, '{}'::jsonb);
+begin
+  if new.email !~* '^[A-Za-z0-9._%+-]+@(dut4life\.ac\.za|dut\.ac\.za)$' then
+    raise exception 'Only DUT email addresses can register';
+  end if;
+
+  insert into public.profiles (id, role, first_name, surname, email, residence, direction, bus_number, phone)
+  values (
+    new.id,
+    m->>'role',
+    m->>'first_name',
+    m->>'surname',
+    lower(new.email),
+    nullif(m->>'residence', ''),
+    nullif(m->>'direction', ''),
+    nullif(upper(m->>'bus_number'), ''),
+    nullif(m->>'phone', '')
+  );
+  return new;
+end $$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- ------------------------------------------------------------- functions
+
+create function public.start_trip(p_residence text, p_direction text, p_duration int)
+returns public.trips
+language plpgsql security definer set search_path = public as $$
+declare
+  p public.profiles;
+  t public.trips;
+begin
+  select * into p from public.profiles where id = auth.uid();
+  if not found or p.role <> 'DRIVER' then
+    raise exception 'Only drivers can start trips.';
+  end if;
+  if p_residence is null or p_residence = '' then
+    raise exception 'Select the residence served by this trip.';
+  end if;
+
+  -- close trips whose time has run out (e.g. the driver's app was closed)
+  update public.trips set active = false
+   where active and started_at + duration_minutes * 60000 < public.now_ms();
+
+  if exists (select 1 from public.trips where active and driver_id = p.id) then
+    raise exception 'You already have an active trip. End it first.';
+  end if;
+  if exists (select 1 from public.trips where active and bus_number = p.bus_number) then
+    raise exception 'Bus % is already on an active trip.', p.bus_number;
+  end if;
+
+  insert into public.trips (driver_id, driver_name, driver_phone, bus_number, residence, direction, duration_minutes)
+  values (p.id, p.first_name || ' ' || p.surname, p.phone, p.bus_number, p_residence, p_direction, p_duration)
+  returning * into t;
+
+  insert into public.alerts (title, message, bus_number, residence, direction)
+  values (
+    'Trip started',
+    format('Bus %s is now live on the %s route (%s).', t.bus_number,
+           case when p_direction = 'RESIDENCE_TO_CAMPUS' then 'Residence → Campus' else 'Campus → Residence' end,
+           p_residence),
+    t.bus_number, p_residence, p_direction
+  );
+  return t;
+end $$;
+
+create function public.end_trip(p_auto boolean default false)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  t public.trips;
+begin
+  update public.trips set active = false
+   where active and driver_id = auth.uid()
+  returning * into t;
+  if not found then
+    return;
+  end if;
+
+  insert into public.alerts (title, message, bus_number, residence, direction)
+  values (
+    case when p_auto then 'Bus arrived' else 'Trip completed' end,
+    format('Bus %s has %s %s.', t.bus_number,
+           case when p_auto then 'arrived at' else 'completed its trip to' end,
+           case when t.direction = 'RESIDENCE_TO_CAMPUS' then 'campus' else 'the residence' end),
+    t.bus_number, t.residence, t.direction
+  );
+end $$;
+
+create function public.send_update(p_message text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  t public.trips;
+begin
+  if p_message is null or btrim(p_message) = '' then
+    raise exception 'Type a message first.';
+  end if;
+  if char_length(p_message) > 160 then
+    raise exception 'Keep updates under 160 characters.';
+  end if;
+
+  select * into t from public.trips
+   where active and driver_id = auth.uid()
+     and started_at + duration_minutes * 60000 > public.now_ms();
+  if not found then
+    raise exception 'Start a trip before sending an update.';
+  end if;
+
+  insert into public.alerts (title, message, bus_number, residence, direction)
+  values ('Driver update · Bus ' || t.bus_number, btrim(p_message), t.bus_number, t.residence, t.direction);
+end $$;
+
+create function public.update_route(p_residence text, p_direction text)
+returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  update public.profiles
+     set residence = p_residence, direction = p_direction
+   where id = auth.uid() and role = 'STUDENT';
+  if not found then
+    raise exception 'Only students can change their route.';
+  end if;
+end $$;
+
+revoke all on function public.start_trip(text, text, int) from public, anon;
+revoke all on function public.end_trip(boolean)           from public, anon;
+revoke all on function public.send_update(text)           from public, anon;
+revoke all on function public.update_route(text, text)    from public, anon;
+grant execute on function public.start_trip(text, text, int) to authenticated;
+grant execute on function public.end_trip(boolean)           to authenticated;
+grant execute on function public.send_update(text)           to authenticated;
+grant execute on function public.update_route(text, text)    to authenticated;
